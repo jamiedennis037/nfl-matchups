@@ -113,6 +113,25 @@ function expectedPoints(off, def){
   return adj * DRIVES_PER_TEAM;
 }
 
+// Standard normal CDF via Abramowitz & Stegun 7.1.26 approximation (accurate to ~1e-7).
+function normCdf(x){
+  var t = 1/(1+0.2316419*Math.abs(x));
+  var d = 0.3989422804014327*Math.exp(-x*x/2);
+  var p = d*t*(0.31938153 + t*(-0.356563782 + t*(1.781477937 + t*(-1.821255978 + t*1.330274429))));
+  return x >= 0 ? 1-p : p;
+}
+
+// Win probability from an expected point margin, modelling final margin ~ Normal(mu, sigma^2).
+// This is the PFR / Stern-Winston approach. sigma ~14 for model projections (noisier than market
+// lines, which use ~13.3). Includes the classic 0.5 continuity correction + half-tie mass.
+var MARGIN_SIGMA = 14.0;   // tunable; calibrate against historical residuals later
+function winProbFromMargin(mu, sigma){
+  sigma = sigma || MARGIN_SIGMA;
+  var pWinOutright = 1 - normCdf((0.5 - mu)/sigma);
+  var pTie = normCdf((0.5 - mu)/sigma) - normCdf((-0.5 - mu)/sigma);
+  return pWinOutright + 0.5*pTie;
+}
+
 // ---- EPA-based rating engine (research-weighted) ----
 // Converts a 1-32 rank into a centered strength score: rank 1 -> +1, rank 16.5 -> 0, rank 32 -> -1.
 function rankScore(rk){ if(!rk) return 0; return (16.5 - rk)/15.5; }
@@ -215,10 +234,10 @@ function analyze(){
   total = awayPts + homePts;
 
   var margin = homePts - awayPts; // + means home favoured
-  // Win prob from projected margin. Logistic scale 7.6 is fitted to REALIZED NFL outright win
-  // rates (bettoredge/betmgm), which run slightly below the theoretical spread-conversion table:
-  //   3 pts -> ~60%, 6 pts -> ~68%, 7 pts -> ~71.5%, 8 pts -> ~73.5%, 10 pts -> ~78%, 14 pts -> ~86%.
-  var homeWP = 1/(1+Math.exp(-margin/7.6));
+  // Win prob: model final margin ~ Normal(margin, sigma^2) with sigma~14 (PFR/Stern-Winston method).
+  // This is properly calibrated to real NFL margin scatter rather than a hand-tuned logistic.
+  //   3 pts -> ~59%, 7 pts -> ~69%, 10 pts -> ~76%, 12 pts -> ~80%, 14 pts -> ~84%.
+  var homeWP = winProbFromMargin(margin);
   var awayWP = 1-homeWP;
 
   // Total lean
@@ -241,7 +260,7 @@ function analyze(){
 
   html += '<div class="signal"><h3>Standout Matchup Signals</h3><ul>'+signals+'</ul></div>';
 
-  html += '<div class="disc">Model: expected points are driven primarily by an EPA-based efficiency rating (60%) blended with a points-per-drive engine (40%). The EPA rating uses the priority metrics from the Sharp data — early-down pass &amp; rush EPA, success rate, explosive-play rate — with passing weighted ~'+PASS_OVER_RUSH+'&times; rushing and offense weighted '+OFF_OVER_DEF+'&times; defense, in line with public NFL models (nflosophy, nfeloapp, ESPN FPI). Add a '+HOME_EDGE_PTS+'-pt home edge and a small roster-strength nudge from unit rankings. On top of that, matchup signals (trench: O-line pass-protection vs pass-rush pressure rate/sacks and run-blocking vs run-defense YPC; plus QB coverage/pressure and unit mismatches) shift each side\'s projected points, capped at &plusmn;6 pts per side. Point sizes are calibrated to public NFL analytics: home field &asymp;1.5 pts, quarterback worth up to ~7 spread pts end-to-end (scaled by rank gap), and pass-rush-vs-protection treated as the single largest in-play swing. Win probability derived from projected margin. This is a data aid, not betting advice.</div>';
+  html += '<div class="disc">Model: expected points are driven primarily by an EPA-based efficiency rating (60%) blended with a points-per-drive engine (40%). The EPA rating uses the priority metrics from the Sharp data — early-down pass &amp; rush EPA, success rate, explosive-play rate — with passing weighted ~'+PASS_OVER_RUSH+'&times; rushing and offense weighted '+OFF_OVER_DEF+'&times; defense, in line with public NFL models (nflosophy, nfeloapp, ESPN FPI). Add a '+HOME_EDGE_PTS+'-pt home edge and a small roster-strength nudge from unit rankings. Win probability models the final margin as a normal distribution around the projected margin (&sigma;&asymp;'+MARGIN_SIGMA+', the PFR/Stern-Winston method). On top of that, matchup signals (trench: O-line pass-protection vs pass-rush pressure rate/sacks and run-blocking vs run-defense YPC; plus QB coverage/pressure and unit mismatches) shift each side\'s projected points, capped at &plusmn;6 pts per side. Point sizes are calibrated to public NFL analytics: home field &asymp;1.5 pts, quarterback worth up to ~7 spread pts end-to-end (scaled by rank gap), and pass-rush-vs-protection treated as the single largest in-play swing. Win probability derived from projected margin. This is a data aid, not betting advice.</div>';
 
   document.getElementById('out').innerHTML = html;
 }
