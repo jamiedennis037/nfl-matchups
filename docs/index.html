@@ -215,9 +215,10 @@ function analyze(){
   total = awayPts + homePts;
 
   var margin = homePts - awayPts; // + means home favoured
-  // Win prob from projected margin. Logistic scale of ~7.0 matches historical NFL spread->win%:
-  // a 3-pt favourite wins ~60%, a 7-pt favourite ~73% — in line with closing-line results.
-  var homeWP = 1/(1+Math.exp(-margin/7.0));
+  // Win prob from projected margin. Logistic scale 7.6 is fitted to REALIZED NFL outright win
+  // rates (bettoredge/betmgm), which run slightly below the theoretical spread-conversion table:
+  //   3 pts -> ~60%, 6 pts -> ~68%, 7 pts -> ~71.5%, 8 pts -> ~73.5%, 10 pts -> ~78%, 14 pts -> ~86%.
+  var homeWP = 1/(1+Math.exp(-margin/7.6));
   var awayWP = 1-homeWP;
 
   // Total lean
