@@ -93,6 +93,10 @@ var FF_EFFICIENCY = 0.45;        // points & yards per drive
 var FF_TURNOVERS  = 0.25;        // ball security / takeaways
 var FF_EXPLOSIVE  = 0.18;        // explosive-play rate
 var FF_SITUATION  = 0.12;        // red-zone + 3-and-out (sustaining/finishing drives)
+// Season scoring rates are noisy/over-dispersed (schedule luck, garbage time). Regress every team's
+// rating toward the league mean by this fraction to recover true talent. ~30-40% is the established
+// range; without it the model over-rates 2025-strong teams and under-rates weak ones across the board.
+var REGRESS = 0.35;
 
 // Forward-looking forecast anchor (Sharp 2026 win totals) applied to TEAM STRENGTH only.
 var LG_AVG_WINS = 8.5;
@@ -122,54 +126,51 @@ function load(){
 // field-position-driven is corrected toward what its underlying play actually supports.
 //
 // factorSignal returns a small multiplier around 1.0 from the non-scoring factors.
+// Work in POINTS-ABOVE-AVERAGE space so the pts/drive edge is preserved (the old ratio-average
+// diluted a good offense back to ~average). Backbone = regressed pts/drive edge. The secondary
+// factors (yards/drive, turnovers, explosiveness) add only SMALL tilts, they cannot erase the backbone.
 function offFourFactors(t){
   var o = t.offense_2025; if(!o || o.pts_per_drive==null) return LG_PTS_PER_DRIVE;
   var name = teamName(t);
   var ef = EFF && EFF.off_eff_ranks && EFF.off_eff_ranks[name];
-  // Efficiency backbone: blend pts/drive and yds/drive (both real values) vs league avg.
-  var ptsRatio = o.pts_per_drive / LG_PTS_PER_DRIVE;
-  var ydsRatio = (o.yds_per_drive!=null ? o.yds_per_drive : LG_YDS_PER_DRIVE) / LG_YDS_PER_DRIVE;
-  var efficiency = 0.7*ptsRatio + 0.3*ydsRatio;                 // ~1.0 = average
-  // Turnovers: fewer giveaways than average = good. to_per_drive_pct lower is better.
-  var toRatio = LG_TO_PER_DRIVE / Math.max(1, (o.to_per_drive_pct!=null?o.to_per_drive_pct:LG_TO_PER_DRIVE));
-  // Explosiveness: from explosive-play rank (only rank available). 1=best.
-  var expl = ef ? (1 + rankScore(ef.explosive_play)*0.10) : 1.0;   // +/-10% swing
-  // Situational: red-zone drive rate + avoiding 3-and-outs.
-  var rzRatio = (o.rz_drive_pct!=null?o.rz_drive_pct:LG_RZ_PCT) / LG_RZ_PCT;
-  // Combine as weighted multiplier around the efficiency backbone.
-  var mult = FF_EFFICIENCY*efficiency
-           + FF_TURNOVERS*toRatio
-           + FF_EXPLOSIVE*expl
-           + FF_SITUATION*rzRatio;
-  // mult is a weighted average of ratios (each ~1.0 at average), so it centres near 1.0.
-  return LG_PTS_PER_DRIVE * mult;
+  // Backbone: points/drive edge vs average, regressed for noise.
+  var ptsEdge = (1-REGRESS)*(o.pts_per_drive - LG_PTS_PER_DRIVE);
+  // Small yards/drive tilt (supports/undercuts the points edge), scaled to points.
+  var ydsRaw = (o.yds_per_drive!=null ? o.yds_per_drive : LG_YDS_PER_DRIVE);
+  var ydsEdge = (1-REGRESS)*((ydsRaw - LG_YDS_PER_DRIVE)/LG_YDS_PER_DRIVE) * LG_PTS_PER_DRIVE * 0.5;
+  // Turnover tilt: fewer giveaways than avg => small positive pts.
+  var toDelta = (LG_TO_PER_DRIVE - (o.to_per_drive_pct!=null?o.to_per_drive_pct:LG_TO_PER_DRIVE)) * 0.015;
+  // Explosiveness tilt from rank (small).
+  var explDelta = ef ? rankScore(ef.explosive_play)*0.10 : 0;
+  var edge = 0.75*ptsEdge + 0.15*ydsEdge + 0.06*toDelta + 0.04*explDelta;
+  return LG_PTS_PER_DRIVE + edge;
 }
 function defFourFactors(t){
   var d = t.defense_2025; if(!d || d.pts_per_drive==null) return LG_PTS_PER_DRIVE;
-  // Defensive pts/drive allowed backbone (lower = better defense).
-  var ptsRatio = d.pts_per_drive / LG_PTS_PER_DRIVE;
-  var ydsRatio = (d.yds_per_drive!=null ? d.yds_per_drive : LG_YDS_PER_DRIVE) / LG_YDS_PER_DRIVE;
-  var efficiency = 0.7*ptsRatio + 0.3*ydsRatio;
-  // Takeaways: MORE takeaways than avg = good defense = lower expected pts allowed.
-  // Defensive to_per_drive_pct higher = more takeaways, so invert relative to offense.
-  var toRatio = Math.max(1, (d.to_per_drive_pct!=null?d.to_per_drive_pct:LG_TO_PER_DRIVE)) / LG_TO_PER_DRIVE;
-  var takeawayFactor = 2 - toRatio;   // more takeaways -> <1 (suppresses opponent pts)
-  var rzRatio = (d.rz_drive_pct!=null?d.rz_drive_pct:LG_RZ_PCT) / LG_RZ_PCT;
-  var mult = FF_EFFICIENCY*efficiency
-           + FF_TURNOVERS*takeawayFactor
-           + FF_EXPLOSIVE*1.0
-           + FF_SITUATION*rzRatio;
-  return LG_PTS_PER_DRIVE * mult;
+  // Backbone: points/drive ALLOWED edge vs average (lower allowed = better = negative edge).
+  var ptsEdge = (1-REGRESS)*(d.pts_per_drive - LG_PTS_PER_DRIVE);
+  var ydsRaw = (d.yds_per_drive!=null ? d.yds_per_drive : LG_YDS_PER_DRIVE);
+  var ydsEdge = (1-REGRESS)*((ydsRaw - LG_YDS_PER_DRIVE)/LG_YDS_PER_DRIVE) * LG_PTS_PER_DRIVE * 0.5;
+  // More takeaways than avg => suppresses opponent points (negative edge).
+  var toDelta = -((d.to_per_drive_pct!=null?d.to_per_drive_pct:LG_TO_PER_DRIVE) - LG_TO_PER_DRIVE) * 0.015;
+  var edge = 0.80*ptsEdge + 0.15*ydsEdge + 0.05*toDelta;
+  return LG_PTS_PER_DRIVE + edge;
 }
 
 // Matchup expected points: combine THIS offense's pts/drive rating with the OPPONENT defense's
 // pts/drive-allowed rating on the real points scale (log5-style: both relative to league average).
 // expected pts/drive = LG * (offRating/LG) * (defRating/LG)  -> then regress lightly to the mean.
+// ADDITIVE combination (not multiplicative): expected pts/drive = league avg
+//   + how much THIS offense is above/below average
+//   + how much the OPPONENT defense is above/below average (allowing more/fewer than avg).
+// Additive avoids the multiplicative structure compounding extremes (elite D x good O ran away).
 function expectedPointsFF(offTeam, defTeam){
-  var offR = offFourFactors(offTeam);
-  var defR = defFourFactors(defTeam);
-  var pd = LG_PTS_PER_DRIVE * (offR/LG_PTS_PER_DRIVE) * (defR/LG_PTS_PER_DRIVE);
-  pd = 0.85*pd + 0.15*LG_PTS_PER_DRIVE;   // light regression to mean
+  var offR = offFourFactors(offTeam);          // regressed offensive pts/drive rating
+  var defR = defFourFactors(defTeam);          // regressed defensive pts/drive-allowed rating
+  var offEdge = offR - LG_PTS_PER_DRIVE;       // + = above-average offense
+  var defEdge = defR - LG_PTS_PER_DRIVE;       // + = below-average defense (allows more)
+  var pd = LG_PTS_PER_DRIVE + offEdge + defEdge;
+  if(pd < 0.3) pd = 0.3;                        // floor
   return pd * DRIVES_PER_TEAM;
 }
 
@@ -358,6 +359,35 @@ function buildSignals(away, home, awayN, homeN){
   }
   offVsDef(away, awayN, home, homeN);
   offVsDef(home, homeN, away, awayN);
+
+  // --- RED ZONE FINISHING MATCHUP ---
+  // Distinct from raw scoring: of drives that REACH the red zone, what fraction end in a TD?
+  //   rz_finish = td_per_drive_pct / rz_drive_pct  (a team's RZ TD-conversion rate)
+  // A strong finisher vs a leaky RZ defense (or a settle-for-FG offense vs an elite RZ D) is a real,
+  // separable edge. RZ rates are noisy so we regress ~50% toward the league finish rate, and cap the
+  // points swing small (+/-1.5) since gross scoring is already in the core. (#10/#34/#35 adapted.)
+  var LG_RZ_FINISH = 0.72;   // league-avg fraction of RZ trips that become TDs (~0.72)
+  var RZ_REG = 0.5;
+  function rzFinish(side){ // side = offense_2025 or defense_2025 object
+    if(!side || side.td_per_drive_pct==null || !side.rz_drive_pct) return LG_RZ_FINISH;
+    var f = side.td_per_drive_pct / side.rz_drive_pct;         // raw finish rate
+    if(f>1) f=1;
+    return LG_RZ_FINISH + (1-RZ_REG)*(f - LG_RZ_FINISH);        // regressed toward mean
+  }
+  function rzMatch(off, offN, def, defN){
+    var offFin = rzFinish(off.offense_2025);       // this offense's RZ TD conversion
+    var defFin = rzFinish(def.defense_2025);       // opponent's RZ TD conversion ALLOWED
+    var edge = offFin - defFin;                    // + => offense finishes better than opp allows
+    // ~7 pts per RZ TD vs ~3 per FG => a full conversion-rate point is worth ~4 pts across ~3 RZ trips.
+    var pts = Math.max(-1.5, Math.min(1.5, edge * 4 * 1.0));
+    if(Math.abs(pts) >= 0.6){
+      addPts(offN, pts);
+      if(pts>0) s.push('<li>&#129001; <b>'+offN+'</b> finishes red-zone trips ('+Math.round(offFin*100)+'% TD) vs a soft <b>'+defN+'</b> red-zone defense ('+Math.round(defFin*100)+'% allowed) — finishing edge (+'+pts.toFixed(1)+' pts).</li>');
+      else s.push('<li>&#128293; <b>'+defN+'</b> tightens in the red zone ('+Math.round(defFin*100)+'% TD allowed) vs a settle-for-FG <b>'+offN+'</b> ('+Math.round(offFin*100)+'% TD) — finishing disadvantage ('+pts.toFixed(1)+' pts '+offN+').</li>');
+    }
+  }
+  rzMatch(away, awayN, home, homeN);
+  rzMatch(home, homeN, away, awayN);
 
   // Four Factors efficiency edge (informational — already in the projected score, so no addPts).
   var aEdge = expectedPointsFF(away, home), hEdge = expectedPointsFF(home, away);
