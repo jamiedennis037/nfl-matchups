@@ -71,21 +71,35 @@
 <script src="coverage_data.js"></script>
 <script src="trench_data.js"></script>
 <script src="efficiency_data.js"></script>
+<script src="forecast_data.js"></script>
 <script>
 var DATA = null;
+var FORECAST = (typeof FORECAST_DATA !== 'undefined') ? FORECAST_DATA : null;
 var COV = (typeof COVERAGE_DATA !== 'undefined') ? COVERAGE_DATA : null;
 var TRENCH = (typeof TRENCH_DATA !== 'undefined') ? TRENCH_DATA : null;
 var EFF = (typeof EFFICIENCY_DATA !== 'undefined') ? EFFICIENCY_DATA : null;
 
-// League baselines (approx NFL average pts/drive ~1.9; total ~44).
-var LG_PTS_PER_DRIVE = 1.95;
+// ---- League baselines (actual 2025 averages computed from the data) ----
+var LG_PTS_PER_DRIVE = 2.11;     // real league-avg points per drive (both sides average ~2.11)
 var DRIVES_PER_TEAM = 11;        // ~11 offensive drives per team per game
-var HOME_EDGE_PTS = 1.8;         // NFL home field: consensus 1.5-2.0; models like nflosophy use ~2.0
-// Research-backed weights (nflosophy/nfeloapp/ESPN FPI): offense is more predictive than defense,
-// and passing efficiency far outweighs rushing for prediction.
-var OFF_OVER_DEF = 1.6;          // offense weighted 1.6x defense in team strength
-var PASS_OVER_RUSH = 1.7;        // passing EPA weighted ~1.7x rushing EPA
-var EPA_BLEND = 0.60;            // expected points = 60% EPA-rating engine + 40% pts/drive engine
+var LG_YDS_PER_DRIVE = 31.05;    // real league-avg yards per drive
+var LG_TO_PER_DRIVE = 10.47;     // real league-avg turnovers per 100 drives (%)
+var LG_RZ_PCT = 30.66;           // real league-avg red-zone drive %
+var HOME_EDGE_PTS = 1.8;         // NFL home field (modern consensus ~1.5-2.0)
+
+// ---- FOUR FACTORS weights (Four Factors framework, aggregate-stat based) ----
+// Efficiency dominates, then turnovers, then explosiveness, then situational/field position.
+var FF_EFFICIENCY = 0.45;        // points & yards per drive
+var FF_TURNOVERS  = 0.25;        // ball security / takeaways
+var FF_EXPLOSIVE  = 0.18;        // explosive-play rate
+var FF_SITUATION  = 0.12;        // red-zone + 3-and-out (sustaining/finishing drives)
+
+// Forward-looking forecast anchor (Sharp 2026 win totals) applied to TEAM STRENGTH only.
+var LG_AVG_WINS = 8.5;
+var WINS_TO_PTS = 0.55;          // pts/game of strength per win above/below average
+var FORECAST_WEIGHT = 0.30;      // modest pull so the season stats lead
+
+function rankScore(rk){ if(!rk) return 0; return (16.5 - rk)/15.5; }
 
 function load(){
   if(typeof TEAM_DATA === 'undefined'){
@@ -101,16 +115,62 @@ function load(){
   a.selectedIndex=0; h.selectedIndex=1;
 }
 
-// Expected points a team's offense scores vs an opponent defense.
-// Blend the offense's pts/drive with what the defense allows, per drive, x drives.
-function expectedPoints(off, def){
-  var oPD = (off.offense_2025 && off.offense_2025.pts_per_drive) || LG_PTS_PER_DRIVE;
-  var dPD = (def.defense_2025 && def.defense_2025.pts_per_drive) || LG_PTS_PER_DRIVE;
-  // matchup-adjusted pts/drive = offense adjusted by how the defense compares to league avg
-  var adj = oPD * (dPD / LG_PTS_PER_DRIVE);
-  // dampen toward league mean a touch (regression)
-  adj = 0.75*adj + 0.25*LG_PTS_PER_DRIVE;
-  return adj * DRIVES_PER_TEAM;
+// ---- FOUR FACTORS RATING (built on real aggregate values, not ranks) ----
+// Produces, for a team, an offensive points-per-drive rating and a defensive points-per-drive-allowed
+// rating. The team's actual pts/drive is the backbone; the other three factors (turnovers,
+// explosiveness, situational) adjust it so a team whose scoring was e.g. turnover-luck-driven or
+// field-position-driven is corrected toward what its underlying play actually supports.
+//
+// factorSignal returns a small multiplier around 1.0 from the non-scoring factors.
+function offFourFactors(t){
+  var o = t.offense_2025; if(!o || o.pts_per_drive==null) return LG_PTS_PER_DRIVE;
+  var name = teamName(t);
+  var ef = EFF && EFF.off_eff_ranks && EFF.off_eff_ranks[name];
+  // Efficiency backbone: blend pts/drive and yds/drive (both real values) vs league avg.
+  var ptsRatio = o.pts_per_drive / LG_PTS_PER_DRIVE;
+  var ydsRatio = (o.yds_per_drive!=null ? o.yds_per_drive : LG_YDS_PER_DRIVE) / LG_YDS_PER_DRIVE;
+  var efficiency = 0.7*ptsRatio + 0.3*ydsRatio;                 // ~1.0 = average
+  // Turnovers: fewer giveaways than average = good. to_per_drive_pct lower is better.
+  var toRatio = LG_TO_PER_DRIVE / Math.max(1, (o.to_per_drive_pct!=null?o.to_per_drive_pct:LG_TO_PER_DRIVE));
+  // Explosiveness: from explosive-play rank (only rank available). 1=best.
+  var expl = ef ? (1 + rankScore(ef.explosive_play)*0.10) : 1.0;   // +/-10% swing
+  // Situational: red-zone drive rate + avoiding 3-and-outs.
+  var rzRatio = (o.rz_drive_pct!=null?o.rz_drive_pct:LG_RZ_PCT) / LG_RZ_PCT;
+  // Combine as weighted multiplier around the efficiency backbone.
+  var mult = FF_EFFICIENCY*efficiency
+           + FF_TURNOVERS*toRatio
+           + FF_EXPLOSIVE*expl
+           + FF_SITUATION*rzRatio;
+  // mult is a weighted average of ratios (each ~1.0 at average), so it centres near 1.0.
+  return LG_PTS_PER_DRIVE * mult;
+}
+function defFourFactors(t){
+  var d = t.defense_2025; if(!d || d.pts_per_drive==null) return LG_PTS_PER_DRIVE;
+  // Defensive pts/drive allowed backbone (lower = better defense).
+  var ptsRatio = d.pts_per_drive / LG_PTS_PER_DRIVE;
+  var ydsRatio = (d.yds_per_drive!=null ? d.yds_per_drive : LG_YDS_PER_DRIVE) / LG_YDS_PER_DRIVE;
+  var efficiency = 0.7*ptsRatio + 0.3*ydsRatio;
+  // Takeaways: MORE takeaways than avg = good defense = lower expected pts allowed.
+  // Defensive to_per_drive_pct higher = more takeaways, so invert relative to offense.
+  var toRatio = Math.max(1, (d.to_per_drive_pct!=null?d.to_per_drive_pct:LG_TO_PER_DRIVE)) / LG_TO_PER_DRIVE;
+  var takeawayFactor = 2 - toRatio;   // more takeaways -> <1 (suppresses opponent pts)
+  var rzRatio = (d.rz_drive_pct!=null?d.rz_drive_pct:LG_RZ_PCT) / LG_RZ_PCT;
+  var mult = FF_EFFICIENCY*efficiency
+           + FF_TURNOVERS*takeawayFactor
+           + FF_EXPLOSIVE*1.0
+           + FF_SITUATION*rzRatio;
+  return LG_PTS_PER_DRIVE * mult;
+}
+
+// Matchup expected points: combine THIS offense's pts/drive rating with the OPPONENT defense's
+// pts/drive-allowed rating on the real points scale (log5-style: both relative to league average).
+// expected pts/drive = LG * (offRating/LG) * (defRating/LG)  -> then regress lightly to the mean.
+function expectedPointsFF(offTeam, defTeam){
+  var offR = offFourFactors(offTeam);
+  var defR = defFourFactors(defTeam);
+  var pd = LG_PTS_PER_DRIVE * (offR/LG_PTS_PER_DRIVE) * (defR/LG_PTS_PER_DRIVE);
+  pd = 0.85*pd + 0.15*LG_PTS_PER_DRIVE;   // light regression to mean
+  return pd * DRIVES_PER_TEAM;
 }
 
 // Standard normal CDF via Abramowitz & Stegun 7.1.26 approximation (accurate to ~1e-7).
@@ -136,54 +196,11 @@ function winProbFromMargin(mu, sigma){
 // Converts a 1-32 rank into a centered strength score: rank 1 -> +1, rank 16.5 -> 0, rank 32 -> -1.
 function rankScore(rk){ if(!rk) return 0; return (16.5 - rk)/15.5; }
 
-// Offensive EPA rating for a team (points scale, ~ +/- a few pts vs league average offense).
-// Built from the priority metrics with passing weighted over rushing and early-down emphasised.
-function offEpaRating(teamN){
-  if(!EFF || !EFF.off_eff_ranks || !EFF.off_eff_ranks[teamN]) return 0;
-  var o = EFF.off_eff_ranks[teamN];
-  var rush = EFF.rush_eff && EFF.rush_eff[teamN];
-  // passing signal: early-down pass EPA (1st half + Q1-3), the most predictive columns available
-  var passSig = (rankScore(o.ed_pass_1h) + rankScore(o.ed_pass_q13)) / 2;
-  // rushing signal: early-down rush EPA + rush efficiency EPA/play
-  var rushSig = (rankScore(o.ed_rush_1h) + rankScore(o.ed_rush_q13) + rankScore(rush?rush.epa_play_rk:null)) / 3;
-  // consistency (success rate / early-down success) as a stabiliser
-  var consist = (rankScore(o.ed_success) + rankScore(rush?rush.success_rk:null)) / 2;
-  // explosiveness (creating big plays)
-  var expl = rankScore(o.explosive_play);
-  // weighted blend: passing dominates, then rush, plus consistency & explosiveness
-  var w = PASS_OVER_RUSH;
-  var core = (w*passSig + 1.0*rushSig) / (w + 1.0);
-  var rating = 0.62*core + 0.24*consist + 0.14*expl;
-  // scale to points: a top offense ~ +4.5 pts, bottom ~ -4.5 pts vs average
-  return rating * 4.5;
-}
-
-// Defensive EPA rating (points scale; positive = good defense = suppresses opponent points).
-// Built from pts/drive allowed + run defense; pass-defense strength via trench pass YPA when present.
-function defEpaRating(teamN){
-  var t = DATA.teams[teamN]; if(!t) return 0;
-  var parts = [], wts = [];
-  if(t.defense_2025 && t.defense_2025.pts_per_drive_rk){ parts.push(rankScore(t.defense_2025.pts_per_drive_rk)); wts.push(1.0); }
-  var tr = TRENCH && TRENCH.teams[teamN];
-  if(tr){
-    if(tr.def_pass_ypa_allowed_rk){ parts.push(rankScore(tr.def_pass_ypa_allowed_rk)); wts.push(PASS_OVER_RUSH); } // pass D weighted heavier
-    else if(tr.def_pass_epa_rk){ parts.push(rankScore(tr.def_pass_epa_rk)); wts.push(PASS_OVER_RUSH); }
-    if(tr.def_rb_ypc_rk){ parts.push(rankScore(tr.def_rb_ypc_rk)); wts.push(1.0); }
-    if(tr.def_pressure_rate_rk){ parts.push(rankScore(tr.def_pressure_rate_rk)); wts.push(0.8); }
-  }
-  if(!parts.length) return 0;
-  var s=0, tw=0; for(var i=0;i<parts.length;i++){ s+=parts[i]*wts[i]; tw+=wts[i]; }
-  return (s/tw) * 4.5;
-}
-
-// Expected points using the EPA engine: league-average scoring + this offense's rating
-// minus the opponent defense's rating (defense weighted a touch less than offense).
-function expectedPointsEpa(offN, defN){
-  var base = LG_PTS_PER_DRIVE * DRIVES_PER_TEAM; // ~21.5 league-average game points
-  var off = offEpaRating(offN);
-  var def = defEpaRating(defN);
-  // offense is more predictive than defense -> defense contributes 1/OFF_OVER_DEF of its rating
-  return base + off - def/OFF_OVER_DEF;
+// Forward-looking team strength from Sharp's 2026 forecast win total, as points/game vs average.
+// A team forecast for 11.5 wins is (11.5-8.5)*0.55 = +1.65 pts/game stronger than average.
+function forecastStrength(teamN){
+  if(!FORECAST || !FORECAST.forecast_wins || FORECAST.forecast_wins[teamN]===undefined) return null;
+  return (FORECAST.forecast_wins[teamN] - LG_AVG_WINS) * WINS_TO_PTS;
 }
 
 // Overall roster/unit strength score (lower rank = better). Returns 0..100 (higher=better).
@@ -211,20 +228,21 @@ function analyze(){
   var away=DATA.teams[awayN], home=DATA.teams[homeN];
   away._n=awayN; home._n=homeN;
 
-  // Expected points: blend the EPA-rating engine (primary, research-weighted) with the
-  // pts-per-drive engine (secondary). EPA-based efficiency is the dominant predictive signal.
-  var awayPts = EPA_BLEND*expectedPointsEpa(awayN, homeN) + (1-EPA_BLEND)*expectedPoints(away, home);
-  var homePts = EPA_BLEND*expectedPointsEpa(homeN, awayN) + (1-EPA_BLEND)*expectedPoints(home, away) + HOME_EDGE_PTS;
-  var total = awayPts + homePts;
+  // Expected points from the FOUR FACTORS engine (single principled model on real aggregate values:
+  // efficiency, turnovers, explosiveness, situational). Each team's offense vs opponent's defense.
+  var awayPts = expectedPointsFF(away, home);
+  var homePts = expectedPointsFF(home, away) + HOME_EDGE_PTS;
+  var base = LG_PTS_PER_DRIVE * DRIVES_PER_TEAM;
 
-  // Roster edge nudges the scoreline
-  var awayRos = rosterScore(away), homeRos = rosterScore(home);
-  var rosDiff = (homeRos - awayRos); // + favours home
-  // apply small point adjustment from roster edge (kept modest so the explicit, heavier
-  // matchup signals below carry the weight rather than double-counting unit ranks)
-  var rosPts = rosDiff * 0.08;
-  homePts += rosPts/2; awayPts -= rosPts/2;
-  total = awayPts + homePts;
+  // Forward-looking forecast anchor (Sharp 2026 win totals) applied to TEAM STRENGTH.
+  // Win totals measure overall team quality, so we pull each team's points toward the forecast-
+  // implied strength. Corrects the backward-looking bias (2025 stats miss 2026 roster/health).
+  var awayFc = forecastStrength(awayN), homeFc = forecastStrength(homeN);
+  if(awayFc!==null && homeFc!==null){
+    awayPts = base + (1-FORECAST_WEIGHT)*(awayPts-base) + FORECAST_WEIGHT*awayFc;
+    homePts = base + (1-FORECAST_WEIGHT)*(homePts-base-HOME_EDGE_PTS) + FORECAST_WEIGHT*homeFc + HOME_EDGE_PTS;
+  }
+  var total = awayPts + homePts;
 
   // --- Matchup adjustments (coverage/pressure) that MOVE the numbers ---
   // Each returns {text, awayAdj, homeAdj} point deltas applied to expected points.
@@ -238,6 +256,8 @@ function analyze(){
   // This is properly calibrated to real NFL margin scatter rather than a hand-tuned logistic.
   //   3 pts -> ~59%, 7 pts -> ~69%, 10 pts -> ~76%, 12 pts -> ~80%, 14 pts -> ~84%.
   var homeWP = winProbFromMargin(margin);
+  // Cap extremes: no single NFL game is a lock. Keep win prob within 3%-97%.
+  homeWP = Math.max(0.03, Math.min(0.97, homeWP));
   var awayWP = 1-homeWP;
 
   // Total lean
@@ -260,7 +280,7 @@ function analyze(){
 
   html += '<div class="signal"><h3>Standout Matchup Signals</h3><ul>'+signals+'</ul></div>';
 
-  html += '<div class="disc">Model: expected points are driven primarily by an EPA-based efficiency rating (60%) blended with a points-per-drive engine (40%). The EPA rating uses the priority metrics from the Sharp data — early-down pass &amp; rush EPA, success rate, explosive-play rate — with passing weighted ~'+PASS_OVER_RUSH+'&times; rushing and offense weighted '+OFF_OVER_DEF+'&times; defense, in line with public NFL models (nflosophy, nfeloapp, ESPN FPI). Add a '+HOME_EDGE_PTS+'-pt home edge and a small roster-strength nudge from unit rankings. Win probability models the final margin as a normal distribution around the projected margin (&sigma;&asymp;'+MARGIN_SIGMA+', the PFR/Stern-Winston method). On top of that, matchup signals (trench: O-line pass-protection vs pass-rush pressure rate/sacks and run-blocking vs run-defense YPC; plus QB coverage/pressure and unit mismatches) shift each side\'s projected points, capped at &plusmn;6 pts per side. Point sizes are calibrated to public NFL analytics: home field &asymp;1.5 pts, quarterback worth up to ~7 spread pts end-to-end (scaled by rank gap), and pass-rush-vs-protection treated as the single largest in-play swing. Win probability derived from projected margin. This is a data aid, not betting advice.</div>';
+  html += '<div class="disc">Model: a <b>Four Factors</b> rating built from real 2025 aggregate values — efficiency (points &amp; yards per drive, '+Math.round(FF_EFFICIENCY*100)+'%), turnovers ('+Math.round(FF_TURNOVERS*100)+'%), explosive-play rate ('+Math.round(FF_EXPLOSIVE*100)+'%) and situational red-zone/drive-sustaining ('+Math.round(FF_SITUATION*100)+'%). Each team\'s offensive rating meets the opponent\'s defensive rating on the points-per-drive scale across ~'+DRIVES_PER_TEAM+' drives, plus a '+HOME_EDGE_PTS+'-pt home edge. A forward-looking anchor from Sharp\'s 2026 forecast win totals ('+Math.round(FORECAST_WEIGHT*100)+'% pull) corrects for 2026 roster/health changes the raw 2025 stats miss. Matchup signals (trenches, QB coverage/pressure, turnover margin) refine each side within a cap. Win probability = Normal(margin, &sigma;&asymp;'+MARGIN_SIGMA+') (PFR/Stern-Winston). A data/analysis aid for screening matchups — weights are established defaults, not backtested to results, so treat it as a guide, not betting advice.</div>';
 
   document.getElementById('out').innerHTML = html;
 }
@@ -339,16 +359,11 @@ function buildSignals(away, home, awayN, homeN){
   offVsDef(away, awayN, home, homeN);
   offVsDef(home, homeN, away, awayN);
 
-  // EPA efficiency edge (informational — already baked into the core expected points, so no addPts).
-  if(EFF){
-    var aOffE=offEpaRating(awayN), hOffE=offEpaRating(homeN);
-    var aDefE=defEpaRating(awayN), hDefE=defEpaRating(homeN);
-    var aNet=aOffE - hDefE/OFF_OVER_DEF, hNet=hOffE - aDefE/OFF_OVER_DEF;
-    var edge=hNet-aNet;
-    if(Math.abs(edge)>=2.5){
-      var eTeam=edge>0?homeN:awayN;
-      s.push('<li>&#128200; <b>'+eTeam+'</b> holds the opponent-adjusted <b>efficiency edge</b> (EPA-based offense vs defense) — reflected in the projected score.</li>');
-    }
+  // Four Factors efficiency edge (informational — already in the projected score, so no addPts).
+  var aEdge = expectedPointsFF(away, home), hEdge = expectedPointsFF(home, away);
+  if(Math.abs(hEdge-aEdge) >= 3){
+    var eTeam = (hEdge>aEdge)?homeN:awayN;
+    s.push('<li>&#128200; <b>'+eTeam+'</b> holds the <b>Four Factors efficiency edge</b> (points/drive matchup) — reflected in the projected score.</li>');
   }
 
   // QB gap. Quarterback is the single biggest positional factor: the full best-to-replacement
@@ -370,6 +385,27 @@ function buildSignals(away, home, awayN, homeN){
   trench(away, awayN, home, homeN, s, addPts);
   trench(home, homeN, away, awayN, s, addPts);
 
+  // Turnover margin (consistent for all 32 teams: offensive to_per_drive_rk = giveaways,
+  // defensive to_per_drive_rk = takeaways; lower rank = better). Turnovers are noisy/regress
+  // heavily year-to-year, so this is a deliberately SMALL nudge (cap ~1.2 pts per side).
+  function turnoverEdge(offN, offT, defN, defT){
+    var give = offT.offense_2025 && offT.offense_2025.to_per_drive_rk;   // this offense's giveaway rank
+    var take = defT.defense_2025 && defT.defense_2025.to_per_drive_rk;   // opp defense's takeaway rank
+    if(!give || !take) return;
+    // both rank 1-32, lower=better. A clean offense (low give) vs a low-takeaway D => fewer TOs => small boost.
+    var giveScore = (16.5 - give)/15.5;   // + = protects the ball well
+    var takeScore = (16.5 - take)/15.5;   // + = opponent forces lots of takeaways (bad for this offense)
+    var net = giveScore - takeScore;      // + = TO battle favours this offense
+    var pts = Math.max(-1.2, Math.min(1.2, net * 1.2));
+    if(Math.abs(pts) >= 0.5){
+      addPts(offN, pts);
+      if(pts > 0) s.push('<li>&#129001; <b>'+offN+'</b> protects the ball (giveaways #'+give+') vs a low-takeaway <b>'+defN+'</b> defense (#'+take+') — turnover edge (+'+pts.toFixed(1)+' pts).</li>');
+      else s.push('<li>&#128293; <b>'+defN+'</b> forces turnovers (#'+take+') against a giveaway-prone <b>'+offN+'</b> (#'+give+') — turnover risk ('+pts.toFixed(1)+' pts '+offN+').</li>');
+    }
+  }
+  turnoverEdge(awayN, away, homeN, home);
+  turnoverEdge(homeN, home, awayN, away);
+
   // Totals context
   var aOff=away.offense_2025&&away.offense_2025.pts_per_drive_rk, hOff=home.offense_2025&&home.offense_2025.pts_per_drive_rk;
   var aDef=away.defense_2025&&away.defense_2025.pts_per_drive_rk, hDef=home.defense_2025&&home.defense_2025.pts_per_drive_rk;
@@ -385,10 +421,14 @@ function buildSignals(away, home, awayN, homeN){
 
   if(s.length===0) s.push('<li>No extreme unit mismatches — a relatively balanced matchup on paper.</li>');
 
-  // Cap total adjustment per side. A genuine multi-factor mismatch (bad QB + bad line vs elite
-  // pass rush) can legitimately be worth a touchdown of spread, so allow up to +/-6.
-  adj.awayAdj = Math.max(-6, Math.min(6, adj.awayAdj));
-  adj.homeAdj = Math.max(-6, Math.min(6, adj.homeAdj));
+  // The core EPA rating already captures most team strength (QB, efficiency, trenches show up in
+  // EPA). The signals therefore DOUBLE-COUNT unless dampened — so we scale them down and cap tighter.
+  // They should refine the line by a point or two, not swing it by a touchdown.
+  var SIGNAL_DAMP = 0.5;   // halve raw signal deltas (they overlap the rating)
+  adj.awayAdj *= SIGNAL_DAMP;
+  adj.homeAdj *= SIGNAL_DAMP;
+  adj.awayAdj = Math.max(-3.5, Math.min(3.5, adj.awayAdj));
+  adj.homeAdj = Math.max(-3.5, Math.min(3.5, adj.homeAdj));
   adj.text = s.join('');
   return adj;
 }
