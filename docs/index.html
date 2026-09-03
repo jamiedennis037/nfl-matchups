@@ -348,17 +348,19 @@ function buildSignals(away, home, awayN, homeN){
   // helper: add a signal and apply a point delta to a named team's expected pts
   function addPts(teamN, pts){ if(teamN===awayN) adj.awayAdj+=pts; else adj.homeAdj+=pts; }
 
-  // Offense vs opposing defense (pts/drive rank gaps)
-  function offVsDef(off, offN, def, defN){
-    var oRk = off.offense_2025 && off.offense_2025.pts_per_drive_rk;
-    var dRk = def.defense_2025 && def.defense_2025.pts_per_drive_rk;
-    if(oRk && dRk){
-      if(oRk<=8 && dRk>=22){ addPts(offN, +2.0); s.push('<li>&#129001; <b>'+offN+'</b> offense (#'+oRk+' pts/drive) faces a weak <b>'+defN+'</b> defense (#'+dRk+') — scoring edge (+2.0 pts).</li>'); }
-      else if(oRk>=24 && dRk<=8){ addPts(offN, -2.0); s.push('<li>&#128293; <b>'+offN+'</b> offense (#'+oRk+') runs into an elite <b>'+defN+'</b> defense (#'+dRk+') — likely to struggle (&minus;2.0 pts).</li>'); }
-    }
+  // NOTE: the old "offVsDef" signal (elite offense vs weak defense = +2 pts) was REMOVED because it
+  // double-counted the core Four Factors rating, which already measures offense-vs-defense on the
+  // points-per-drive scale. Signals below only add information the core does NOT already contain
+  // (trench pressure, QB coverage, red-zone finishing, turnovers). We still SHOW the core edge as an
+  // informational line (no points added) so the user sees which side the model favours.
+  {
+    var aOR = away.offense_2025 && away.offense_2025.pts_per_drive_rk;
+    var hDR = home.defense_2025 && home.defense_2025.pts_per_drive_rk;
+    if(aOR && hDR && aOR<=8 && hDR>=22) s.push('<li>&#129001; <b>'+awayN+'</b> offense (#'+aOR+' pts/drive) vs a weak <b>'+homeN+'</b> defense (#'+hDR+') — already reflected in the score.</li>');
+    var hOR = home.offense_2025 && home.offense_2025.pts_per_drive_rk;
+    var aDR = away.defense_2025 && away.defense_2025.pts_per_drive_rk;
+    if(hOR && aDR && hOR<=8 && aDR>=22) s.push('<li>&#129001; <b>'+homeN+'</b> offense (#'+hOR+' pts/drive) vs a weak <b>'+awayN+'</b> defense (#'+aDR+') — already reflected in the score.</li>');
   }
-  offVsDef(away, awayN, home, homeN);
-  offVsDef(home, homeN, away, awayN);
 
   // --- RED ZONE FINISHING MATCHUP ---
   // Distinct from raw scoring: of drives that REACH the red zone, what fraction end in a TD?
@@ -412,29 +414,47 @@ function buildSignals(away, home, awayN, homeN){
 
   // Trenches: offense's O-line vs opposing defensive front, using granular trench_data
   // (pressure rate, sacks, run-D YPC/YBC) with fallback to the Front7/OL positional ranks.
-  trench(away, awayN, home, homeN, s, addPts);
-  trench(home, homeN, away, awayN, s, addPts);
+  // passProDone[offN]=true once a pass-protection point swing has fired, so the clean-pocket
+  // coverage signal below won't double-count the same "QB has time" edge.
+  var passProDone = {};
+  trench(away, awayN, home, homeN, s, addPts, passProDone);
+  trench(home, homeN, away, awayN, s, addPts, passProDone);
 
-  // Turnover margin (consistent for all 32 teams: offensive to_per_drive_rk = giveaways,
-  // defensive to_per_drive_rk = takeaways; lower rank = better). Turnovers are noisy/regress
-  // heavily year-to-year, so this is a deliberately SMALL nudge (cap ~1.2 pts per side).
-  function turnoverEdge(offN, offT, defN, defT){
-    var give = offT.offense_2025 && offT.offense_2025.to_per_drive_rk;   // this offense's giveaway rank
-    var take = defT.defense_2025 && defT.defense_2025.to_per_drive_rk;   // opp defense's takeaway rank
-    if(!give || !take) return;
-    // both rank 1-32, lower=better. A clean offense (low give) vs a low-takeaway D => fewer TOs => small boost.
-    var giveScore = (16.5 - give)/15.5;   // + = protects the ball well
-    var takeScore = (16.5 - take)/15.5;   // + = opponent forces lots of takeaways (bad for this offense)
-    var net = giveScore - takeScore;      // + = TO battle favours this offense
-    var pts = Math.max(-1.2, Math.min(1.2, net * 1.2));
-    if(Math.abs(pts) >= 0.5){
-      addPts(offN, pts);
-      if(pts > 0) s.push('<li>&#129001; <b>'+offN+'</b> protects the ball (giveaways #'+give+') vs a low-takeaway <b>'+defN+'</b> defense (#'+take+') — turnover edge (+'+pts.toFixed(1)+' pts).</li>');
-      else s.push('<li>&#128293; <b>'+defN+'</b> forces turnovers (#'+take+') against a giveaway-prone <b>'+offN+'</b> (#'+give+') — turnover risk ('+pts.toFixed(1)+' pts '+offN+').</li>');
+  // Turnovers are ALREADY a component of the Four Factors core rating, so adding a turnover-margin
+  // point swing here would double-count. We keep it INFORMATIONAL only (no addPts) — flag a stark
+  // turnover mismatch so the user sees it, but don't move the number twice.
+  {
+    function toEdge(offT, offN, defT, defN){
+      var give = offT.offense_2025 && offT.offense_2025.to_per_drive_rk;
+      var take = defT.defense_2025 && defT.defense_2025.to_per_drive_rk;
+      if(!give || !take) return;
+      if(give<=6 && take<=6) s.push('<li>&#129001; <b>'+offN+'</b> protects the ball (#'+give+') vs a takeaway-heavy <b>'+defN+'</b> D (#'+take+') — turnover battle (already in the score).</li>');
+      else if(give>=26 && take<=6) s.push('<li>&#128293; <b>'+defN+'</b> forces turnovers (#'+take+') vs giveaway-prone <b>'+offN+'</b> (#'+give+') — turnover risk (already in the score).</li>');
     }
+    toEdge(away, awayN, home, homeN);
+    toEdge(home, homeN, away, awayN);
   }
-  turnoverEdge(awayN, away, homeN, home);
-  turnoverEdge(homeN, home, awayN, away);
+
+  // --- EARLY-DOWN & 3rd-DOWN matchups (guide #8/#9) — INFORMATIONAL ONLY ---
+  // Drive-sustaining efficiency (early-down success, 3rd-down conversion, 3-and-out avoidance) is
+  // ALREADY the backbone of the Four Factors core (yards/drive, 3-and-out%, points/drive). Adding a
+  // separate point swing here would double-count that. So we FLAG a stark mismatch for the user but
+  // move NO points. offense down_set_conv (chain-moving) vs opponent defense down_set_conv allowed.
+  {
+    function chainEdge(offT, offN, defT, defN){
+      var oConv = offT.offense_2025 && offT.offense_2025.down_set_conv_rk;   // 1 = best at moving chains
+      var dStop = defT.defense_2025 && defT.defense_2025.down_set_conv_rk;   // 1 = best at getting off field
+      var oThird = EFF && EFF.off_eff_ranks && EFF.off_eff_ranks[offN] && EFF.off_eff_ranks[offN].third_conv;
+      if(oConv && dStop && oConv<=8 && dStop>=24){
+        var thirdTxt = oThird ? (' (3rd-down #'+oThird+')') : '';
+        s.push('<li>&#129001; <b>'+offN+'</b> sustains drives'+thirdTxt+' (#'+oConv+') vs a <b>'+defN+'</b> D that struggles to get off the field (#'+dStop+') — chain-moving edge (already in the score).</li>');
+      } else if(oConv && dStop && oConv>=24 && dStop<=8){
+        s.push('<li>&#128293; <b>'+defN+'</b> gets off the field (#'+dStop+') vs a stalling <b>'+offN+'</b> offense (#'+oConv+') — drives stall early (already in the score).</li>');
+      }
+    }
+    chainEdge(away, awayN, home, homeN);
+    chainEdge(home, homeN, away, awayN);
+  }
 
   // Totals context
   var aOff=away.offense_2025&&away.offense_2025.pts_per_drive_rk, hOff=home.offense_2025&&home.offense_2025.pts_per_drive_rk;
@@ -445,27 +465,31 @@ function buildSignals(away, home, awayN, homeN){
   }
   // --- Coverage & pressure matchups (from coverage_data.js) — these MOVE the numbers ---
   if(COV){
-    coverageSignals(awayN, homeN, s, addPts);
-    coverageSignals(homeN, awayN, s, addPts);
+    coverageSignals(awayN, homeN, s, addPts, passProDone);
+    coverageSignals(homeN, awayN, s, addPts, passProDone);
   }
 
   if(s.length===0) s.push('<li>No extreme unit mismatches — a relatively balanced matchup on paper.</li>');
 
   // The core EPA rating already captures most team strength (QB, efficiency, trenches show up in
   // EPA). The signals therefore DOUBLE-COUNT unless dampened — so we scale them down and cap tighter.
-  // They should refine the line by a point or two, not swing it by a touchdown.
-  var SIGNAL_DAMP = 0.5;   // halve raw signal deltas (they overlap the rating)
+  // The pure double-count signals (offense-vs-defense scoring, turnover margin) are now INFORMATIONAL
+  // only. The remaining point-moving signals (QB gap, trench pressure, coverage, red-zone finishing)
+  // carry information NOT in the core rating, so they need only a light dampener for residual overlap
+  // (e.g. QB partly shows up in pts/drive). 0.7 keeps genuine edges meaningful without letting them
+  // stack into a touchdown. Cap at +/-3 per side.
+  var SIGNAL_DAMP = 0.7;
   adj.awayAdj *= SIGNAL_DAMP;
   adj.homeAdj *= SIGNAL_DAMP;
-  adj.awayAdj = Math.max(-3.5, Math.min(3.5, adj.awayAdj));
-  adj.homeAdj = Math.max(-3.5, Math.min(3.5, adj.homeAdj));
+  adj.awayAdj = Math.max(-3, Math.min(3, adj.awayAdj));
+  adj.homeAdj = Math.max(-3, Math.min(3, adj.homeAdj));
   adj.text = s.join('');
   return adj;
 }
 
 // Two-way trench matchup. Uses granular trench_data (pass rush + run defense) when available,
 // falling back to Front7/OL positional ranks. Splits into a PASS-PROTECTION edge and a RUN-BLOCKING edge.
-function trench(off, offN, def, defN, s, addPts){
+function trench(off, offN, def, defN, s, addPts, passProDone){
   var offT = TRENCH && TRENCH.teams[offN];   // offense trench profile (O-line side)
   var defT = TRENCH && TRENCH.teams[defN];   // defense trench profile (front side)
   var ol   = (off.positional_ranks||{})["Offensive Line"];
@@ -483,11 +507,13 @@ function trench(off, offN, def, defN, s, addPts){
     if(pgap <= -10){ // strong pass rush vs weak protection — the biggest in-play swing in the NFL
       var pen = Math.min(2.8, 1.2 + (-pgap-10)*0.08);
       addPts(offN, -pen);
+      if(passProDone) passProDone[offN] = true;  // QB under duress — block the clean-pocket bonus
       var d = pr ? (pr+'% pressure, #'+rushRk+')') : ('#'+rushRk+')');
       s.push('<li>&#128293; <b>'+defN+'</b> pass rush ('+d+' overwhelms <b>'+offN+'</b> pass protection (#'+protRk+')'+(sk?(' — '+sk+' sacks last yr'):'')+' — QB under duress (&minus;'+pen.toFixed(1)+' pts '+offN+').</li>');
     } else if(pgap >= 10){ // strong protection vs weak rush
       var add = Math.min(2.2, 1.0 + (pgap-10)*0.06);
       addPts(offN, +add);
+      if(passProDone) passProDone[offN] = true;  // clean-pocket edge already applied here
       var d2 = pr ? (pr+'% pressure, #'+rushRk+')') : ('#'+rushRk+')');
       s.push('<li>&#129001; <b>'+offN+'</b> O-line (#'+protRk+') gives clean pockets vs a soft <b>'+defN+'</b> pass rush ('+d2+' — time to throw (+'+add.toFixed(1)+' pts '+offN+').</li>');
     }
@@ -523,48 +549,103 @@ function qbForTeam(teamN){
   return candidates[0]||null;
 }
 
-function coverageSignals(offN, defN, s, addPts){
+function coverageSignals(offN, defN, s, addPts, passProDone){
   var qb = qbForTeam(offN); if(!qb) return;
   var cov = COV.qb_coverage_2025[qb];
   var pr  = COV.qb_pressure_2025[qb];
   var def = COV.def_tendencies[defN];
 
-  // PRESSURE MATCHUP: QB being-blitzed profile vs opponent blitz rate
-  if(pr && def && def.blitz_rk){
-    var bz = pr.being_blitzed_rk;      // 1=best vs blitz, 45=worst
-    var up = pr.under_pressure_rk;
-    if(def.blitz_rk<=8 && bz>=28){
-      addPts(offN, -2.0);
-      s.push('<li>&#128293; <b>'+defN+'</b> blitzes heavily ('+def.blitz_pct+'%, #'+def.blitz_rk+') and <b>'+qb+'</b> struggles when blitzed (#'+bz+') — <b>pressure edge '+defN+'</b> (&minus;2.0 pts '+offN+').</li>');
+  // ============================================================================================
+  // MATCHUP TRUTH-TABLE LOGIC (per the QB/DEFENSE matchup guide).
+  // CORE RULE: match a QB trait against WHAT THE DEFENSE ACTUALLY DOES, and weight by frequency.
+  //  - QB strong at X  + defense forces X often  -> tested but holds up  (neutral / slight +)
+  //  - QB strong at X  + defense rarely does X    -> strength not utilised (neutral, no points)
+  //  - QB weak at X    + defense forces X often    -> WEAKNESS EXPLOITED  (negative)
+  //  - QB weak at X    + defense rarely does X      -> weakness hidden     (positive, weakness avoided)
+  // "Rank midpoint" = league average: 45 QBs -> ~23; 32 defenses -> ~16.
+  // We only have BOTH sides of the data for PRESSURE and BLITZ, so those get the full truth table.
+  // (Coverage-type FREQUENCY per defense is NOT in our data, so we do NOT fabricate a man/zone-rate
+  // matchup — the coverage block below stays a proxy on secondary strength only.)
+  // ============================================================================================
+  var QB_MID = 23, DEF_MID = 16;
+
+  // ---- PRESSURE (guide #2): QB under-pressure skill vs defense's pressure-generation rate ----
+  var dtr = TRENCH && TRENCH.teams[defN];
+  var defPressRk = dtr && dtr.def_pressure_rate_rk;   // 1 = best pass rush (pressures often), 32 = worst
+  if(pr && defPressRk){
+    var upRk = pr.under_pressure_rk;                  // 1 = best when pressured, 45 = worst
+    var qbHandles = upRk <= QB_MID;                   // above-average vs pressure
+    var defPressures = defPressRk <= DEF_MID;         // above-average pressure rate
+    var pRate = dtr.def_pressure_rate ? dtr.def_pressure_rate+'%, ' : '';
+    if(!qbHandles && defPressures){
+      // WEAKNESS EXPLOITED — the strongest of the four; scale by how extreme both are.
+      var pen = Math.min(2.5, 0.8 + (upRk-QB_MID)*0.05 + (DEF_MID-defPressRk)*0.05);
+      addPts(offN, -pen);
+      s.push('<li>&#128293; <b>'+qb+'</b> struggles under pressure (#'+upRk+') vs <b>'+defN+'</b>\'s heavy pass rush ('+pRate+'#'+defPressRk+') — pressure exploited (&minus;'+pen.toFixed(1)+' pts '+offN+').</li>');
+    } else if(qbHandles && !defPressures && !(passProDone && passProDone[offN])){
+      // Strength meets a weak rush — QB stays clean AND is good = real, but modest, edge.
+      // Skipped if the trench pass-protection bonus already fired for this offense (no double-count).
+      var b1 = Math.min(1.2, 0.5 + (QB_MID-upRk)*0.03 + (defPressRk-DEF_MID)*0.04);
+      if(b1>=0.5){ addPts(offN, +b1); s.push('<li>&#129001; <b>'+qb+'</b> is comfortable when pressured (#'+upRk+') and <b>'+defN+'</b> rarely gets home ('+pRate+'#'+defPressRk+') — clean pocket to operate (+'+b1.toFixed(1)+' pts '+offN+').</li>'); }
+    } else if(!qbHandles && !defPressures){
+      // WEAKNESS HIDDEN — QB is shaky under pressure but won't face much, small positive.
+      var b2 = Math.min(0.8, 0.4 + (defPressRk-DEF_MID)*0.03);
+      if(b2>=0.4){ addPts(offN, +b2); s.push('<li>&#129001; <b>'+qb+'</b> is shaky under pressure (#'+upRk+') but <b>'+defN+'</b> rarely pressures ('+pRate+'#'+defPressRk+') — weakness avoided (+'+b2.toFixed(1)+' pts '+offN+').</li>'); }
     }
-    else if(def.blitz_rk>=25 && up<=10){
-      addPts(offN, +1.6);
-      s.push('<li>&#129001; <b>'+defN+'</b> rarely blitzes ('+def.blitz_pct+'%, #'+def.blitz_rk+') and <b>'+qb+'</b> is strong under pressure (#'+up+') — clean-pocket <b>edge '+offN+'</b> (+1.6 pts).</li>');
-    }
-    else if(def.blitz_rk<=8 && bz<=8){
-      addPts(offN, +1.5);
-      s.push('<li>&#129001; <b>'+defN+'</b> blitzes a lot ('+def.blitz_pct+'%) but <b>'+qb+'</b> punishes the blitz (#'+bz+') — QB exploits aggression (+1.5 pts '+offN+').</li>');
-    }
+    // qbHandles && defPressures => tested but holds up => NEUTRAL, no points.
   }
 
-  // COVERAGE MATCHUP: QB man/zone/2-high vs opponent secondary
+  // ---- BLITZ (guide #4): QB vs-blitz skill vs defense's blitz rate ----
+  if(pr && def && def.blitz_rk){
+    var bz = pr.being_blitzed_rk;      // 1 = best vs blitz, 45 = worst
+    var qbBlitzOk = bz <= QB_MID;
+    var defBlitzes = def.blitz_rk <= DEF_MID;
+    if(qbBlitzOk && defBlitzes){
+      // QB punishes the blitz + defense blitzes often = POSITIVE (guide: exploit).
+      var bb = Math.min(1.8, 0.7 + (QB_MID-bz)*0.04 + (DEF_MID-def.blitz_rk)*0.05);
+      addPts(offN, +bb);
+      s.push('<li>&#129001; <b>'+qb+'</b> punishes the blitz (#'+bz+') and <b>'+defN+'</b> blitzes often ('+def.blitz_pct+'%, #'+def.blitz_rk+') — QB exploits aggression (+'+bb.toFixed(1)+' pts '+offN+').</li>');
+    } else if(!qbBlitzOk && defBlitzes){
+      // QB struggles vs blitz + defense blitzes often = MAJOR WEAKNESS EXPLOITED.
+      var bp = Math.min(2.2, 0.8 + (bz-QB_MID)*0.05 + (DEF_MID-def.blitz_rk)*0.05);
+      addPts(offN, -bp);
+      s.push('<li>&#128293; <b>'+qb+'</b> struggles vs the blitz (#'+bz+') and <b>'+defN+'</b> blitzes often ('+def.blitz_pct+'%, #'+def.blitz_rk+') — blitz weakness exploited (&minus;'+bp.toFixed(1)+' pts '+offN+').</li>');
+    }
+    // qbBlitzOk && !defBlitzes => strength wasted => NEUTRAL.
+    // !qbBlitzOk && !defBlitzes => weakness avoided => small positive already covered by the
+    //   pressure "weakness hidden" case above, so we don't add again here (avoid double-count).
+  }
+
+  // COVERAGE MATCHUP: QB man/zone/2-high/deep vs opponent secondary.
+  // IMPORTANT: man, zone and deep are DIFFERENT VIEWS OF THE SAME THING — a good passer against a
+  // weak secondary. Summing them triple-counts one edge (this was inflating every elite QB vs a
+  // bottom-8 secondary by up to ~+3.7). So we take the SINGLE STRONGEST coverage edge, not the sum,
+  // and report the others as supporting text only. Applies uniformly to all 32 teams.
   if(cov){
     var secRk = (DATA.teams[defN].positional_ranks||{})["Secondary"];
+    var covPts = 0;      // net coverage point swing (best single edge)
+    var covMsg = '';     // description of the driving edge
+    var supports = [];   // supporting (non-scoring) coverage notes
+    // Negative edge: QB struggles vs 2-high against an elite secondary.
     if(cov.two_high_rk>=28 && secRk && secRk<=8){
-      addPts(offN, -1.5);
-      s.push('<li>&#128293; <b>'+qb+'</b> struggles vs 2-high (#'+cov.two_high_rk+') against a top-'+secRk+' <b>'+defN+'</b> secondary — coverage disadvantage (&minus;1.5 pts '+offN+').</li>');
+      if(-1.5 < covPts || covPts===0){ covPts = -1.5; covMsg = '&#128293; <b>'+qb+'</b> struggles vs 2-high (#'+cov.two_high_rk+') against a top-'+secRk+' <b>'+defN+'</b> secondary — coverage disadvantage'; }
     }
-    if(cov.man_rk<=6 && secRk && secRk>=24){
-      addPts(offN, +1.5);
-      s.push('<li>&#129001; <b>'+qb+'</b> elite vs man (#'+cov.man_rk+') and <b>'+defN+'</b> secondary weak (#'+secRk+') — passing edge (+1.5 pts '+offN+').</li>');
+    // Positive edges vs a weak secondary — keep the largest, list the rest as support.
+    var posEdges = [];
+    if(cov.man_rk<=6 && secRk && secRk>=24) posEdges.push({p:1.5, t:'elite vs man (#'+cov.man_rk+')'});
+    if(cov.zone_rk<=6 && secRk && secRk>=24) posEdges.push({p:1.2, t:'shreds zone (#'+cov.zone_rk+')'});
+    if(cov.deep_rk<=5 && secRk && secRk>=22) posEdges.push({p:1.0, t:'top-'+cov.deep_rk+' deep passer'});
+    if(posEdges.length){
+      posEdges.sort(function(a,b){return b.p-a.p;});
+      var best = posEdges[0];
+      if(best.p > covPts){ covPts = best.p; covMsg = '&#129001; <b>'+qb+'</b> '+best.t+' vs a weak <b>'+defN+'</b> secondary (#'+secRk+') — passing edge'; }
+      for(var i=1;i<posEdges.length;i++) supports.push(posEdges[i].t);
     }
-    if(cov.zone_rk<=6 && secRk && secRk>=24){
-      addPts(offN, +1.2);
-      s.push('<li>&#129001; <b>'+qb+'</b> shreds zone (#'+cov.zone_rk+') vs weak <b>'+defN+'</b> secondary (#'+secRk+') — passing edge (+1.2 pts '+offN+').</li>');
-    }
-    if(cov.deep_rk<=5 && secRk && secRk>=22){
-      addPts(offN, +1.0);
-      s.push('<li>&#129001; <b>'+qb+'</b> top-'+cov.deep_rk+' deep passer vs soft <b>'+defN+'</b> secondary (#'+secRk+') — explosive-pass potential (+1.0 pts '+offN+').</li>');
+    if(covPts!==0){
+      addPts(offN, covPts);
+      var supTxt = supports.length ? ' (also '+supports.join(', ')+')' : '';
+      var sign = covPts>0 ? '+'+covPts.toFixed(1) : '&minus;'+Math.abs(covPts).toFixed(1);
+      s.push('<li>'+covMsg+supTxt+' ('+sign+' pts '+offN+').</li>');
     }
   }
 }
